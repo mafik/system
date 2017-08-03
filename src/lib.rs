@@ -5,12 +5,7 @@ use std::mem;
 use std::any::Any;
 use std::sync::mpsc::{self, Sender, Receiver};
 
-// Menu is going to live in a separate module.
-// It'll map various object actions into GUI.
-
-// Rendering will work the same way.
-
-pub fn alloc<T>(val: T) -> *mut T {
+fn alloc<T>(val: T) -> *mut T {
     Box::into_raw(Box::new(val))
 }
 
@@ -130,8 +125,8 @@ fn find_element(object: *const Object, name: &String) -> Option<*mut Frame> {
 }
 
 impl Frame {
-    pub fn adopt(&mut self, adopted: Option<*mut Object>) {
-        self.object = adopted;
+    pub fn adopt(&mut self, adopted: Option<Box<Object>>) {
+        self.object = adopted.map(Box::into_raw);
         self.maybe_update_frame();
     }
     fn maybe_update_frame(&mut self) {
@@ -175,8 +170,8 @@ impl Frame {
 }
 
 impl System {
-    pub fn new() -> *mut System {
-        alloc(System {
+    pub fn new() -> Box<System> {
+        Box::new(System {
             frame: None,
             frames: Vec::new(),
             tasks: VecDeque::new(),
@@ -209,29 +204,34 @@ impl System {
         }
         return None;
     }
-    fn pick_name(&self, object: &Option<*mut Object>) -> String {
+    fn pick_name(&self, frame: *mut Frame) {
+        let object = unsafe { (*frame).object };
         let base = match object {
-            &Some(object) => unsafe { (*object).name().to_string() },
-            &None => "Frame".to_string(),
+            Some(object) => unsafe { (*object).name().to_string() },
+            None => "Frame".to_string(),
         };
-        if let Some(_) = find_element(self, &base) {
+        let name = if let Some(_) = find_element(self, &base) {
             let mut counter = 2;
             let mut candidate = base.clone() + &counter.to_string();
             while let Some(_) = find_element(self, &candidate) {
                 counter += 1;
                 candidate = base.clone() + &counter.to_string();
             }
-            return candidate;
+            candidate
         } else {
-            return base;
+            base
+        };
+        unsafe {
+            (*frame).name = name;
         }
     }
-    pub fn frame(&mut self, object: Option<*mut Object>) -> *mut Frame {
+    pub fn frame(&mut self, object: Option<Box<Object>>) -> *mut Frame {
         let frame = alloc(Frame {
             parent: self,
-            name: self.pick_name(&object),
-            object,
+            name: String::new(),
+            object: object.map(Box::into_raw),
         });
+        self.pick_name(frame);
         unsafe {
             (*frame).maybe_update_frame();
         }
@@ -265,7 +265,7 @@ impl System {
         }
     }
     pub fn run_until_done(&mut self) {
-        while !self.tasks.is_empty() {
+        while !self.tasks.is_empty() || !self.background_tasks.is_empty() {
             self.run_one();
         }
     }
@@ -275,11 +275,38 @@ impl System {
         }
     }
     pub fn run_one(&mut self) {
+        // TODO: Replace with multi-channel selection, once it's available
+        //       (https://github.com/rust-lang/rust/issues/27800)
+
+        let mut i = 0;
+        while i < self.background_tasks.len() {
+            let recv_result = self.background_tasks[i].receiver.try_recv();
+            match recv_result {
+                Ok(update) => {
+                    let frame = self.background_tasks[i].frame;
+                    let object = unsafe { (*frame).object };
+                    let object = object.unwrap();
+                    let runnable = unsafe { (*object).runnable() };
+                    let runnable = runnable.unwrap();
+                    runnable.update(unsafe { &mut *frame }, update);
+                    return;
+                }
+                Err(mpsc::TryRecvError::Empty) => {
+                    i += 1;
+                }
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    let frame = self.background_tasks[i].frame;
+                    self.background_tasks.swap_remove(i);
+                    self.run_finished(frame);
+                }
+            }
+        }
+
         match self.tasks.pop_front() {
             Some(frame) => {
                 self.run_frame(frame);
             }
-            None => unimplemented!(),
+            None => (),
         }
     }
     fn run_finished(&mut self, frame: *mut Frame) {
@@ -317,6 +344,11 @@ impl System {
             parent.run_finished(frame);
         }
     }
+    fn is_running(&self, frame: *mut Frame) -> bool {
+        self.background_tasks.iter().any(|task| {
+            ptr::eq(task.frame, frame)
+        })
+    }
     fn run_frame(&mut self, frame: *mut Frame) {
         unsafe {
             match (*frame).object {
@@ -324,7 +356,9 @@ impl System {
                     match (*object).runnable() {
                         Some(ref mut runnable) => {
                             runnable.run(&mut *frame);
-                            self.run_finished(frame);
+                            if !self.is_running(frame) {
+                                self.run_finished(frame);
+                            }
                         }
                         _ => unimplemented!(),
                     }
@@ -431,7 +465,7 @@ impl Object for System {
 impl Runnable for System {
     fn run(&mut self, _: &mut RunContext) {
         self.run_one();
-        if !self.tasks.is_empty() {
+        if !self.tasks.is_empty() || !self.background_tasks.is_empty() {
             if let Some(frame) = self.frame {
                 self.mark(frame);
             }
@@ -453,11 +487,11 @@ mod tests {
     }
 
     impl MockObject {
-        fn new(name: String, log: &Log) -> Self {
-            MockObject {
+        fn new(name: String, log: &Log) -> Box<Self> {
+            Box::new(MockObject {
                 name,
                 log: log.clone(),
-            }
+            })
         }
     }
 
@@ -480,7 +514,7 @@ mod tests {
     }
 
     struct TestableSystem {
-        system: &'static mut System,
+        system: Box<System>,
         a: *mut Frame,
         b: *mut Frame,
         c: *mut Frame,
@@ -496,11 +530,11 @@ mod tests {
             Test { log }
         }
         fn make_system(&self, name: &'static str) -> TestableSystem {
-            let system = unsafe { &mut *System::new() };
+            let mut system = System::new();
             let name = name.to_string();
-            let a = system.frame(Some(alloc(MockObject::new(name.clone() + ":a", &self.log))));
-            let b = system.frame(Some(alloc(MockObject::new(name.clone() + ":b", &self.log))));
-            let c = system.frame(Some(alloc(MockObject::new(name + ":c", &self.log))));
+            let a = system.frame(Some(MockObject::new(name.clone() + ":a", &self.log)));
+            let b = system.frame(Some(MockObject::new(name.clone() + ":b", &self.log)));
+            let c = system.frame(Some(MockObject::new(name + ":c", &self.log)));
             return TestableSystem { system, a, b, c };
         }
         fn log(&self) -> String {
@@ -526,7 +560,7 @@ mod tests {
     }
 
     #[test]
-    fn frame_swap() {
+    fn swap() {
         let test = Test::new();
         let TestableSystem { mut system, a, b, .. } = test.make_system("");
         Frame::swap(a, b);
@@ -536,7 +570,7 @@ mod tests {
     }
 
     #[test]
-    fn run_two() {
+    fn then() {
         let test = Test::new();
         let TestableSystem { mut system, a, b, .. } = test.make_system("");
         system.link(a, b, Relation::Then);
@@ -546,7 +580,7 @@ mod tests {
     }
 
     #[test]
-    fn run_loop() {
+    fn test_loop() {
         let test = Test::new();
         let TestableSystem { mut system, a, .. } = test.make_system("");
         system.link(a, a, Relation::Then);
@@ -556,7 +590,7 @@ mod tests {
     }
 
     #[test]
-    fn run_split() {
+    fn split() {
         let test = Test::new();
         let TestableSystem {
             mut system,
@@ -572,7 +606,7 @@ mod tests {
     }
 
     #[test]
-    fn run_merge() {
+    fn merge() {
         let test = Test::new();
         let TestableSystem {
             mut system,
@@ -589,7 +623,7 @@ mod tests {
     }
 
     #[test]
-    fn run_twice() {
+    fn repeat() {
         let test = Test::new();
         let TestableSystem {
             mut system,
@@ -610,7 +644,7 @@ mod tests {
 
     struct CrossSystemTest {
         test: Test,
-        system: &'static mut System,
+        system: Box<System>,
         top: *mut Frame,
         left: *mut Frame,
         right: *mut Frame,
@@ -636,9 +670,6 @@ mod tests {
                 (*top.b).adopt(Some(left_system));
                 (*top.c).adopt(Some(right_system));
             }
-            println!("Top system: {:?}", top.system as *mut System);
-            println!("Left system: {:?}", left_system as *mut System);
-            println!("Right system: {:?}", right_system as *mut System);
             CrossSystemTest {
                 test,
                 system: top.system,
@@ -652,7 +683,7 @@ mod tests {
     }
 
     #[test]
-    fn run_into_system() {
+    fn enter_system() {
         let CrossSystemTest {
             test,
             mut system,
@@ -669,7 +700,7 @@ mod tests {
     }
 
     #[test]
-    fn run_out_of_system() {
+    fn exit_system() {
         let CrossSystemTest {
             test,
             mut system,
@@ -686,7 +717,7 @@ mod tests {
     }
 
     #[test]
-    fn run_across_systems() {
+    fn cross_systems() {
         let CrossSystemTest {
             test,
             mut system,
@@ -709,67 +740,103 @@ mod tests {
 
     #[test]
     fn system_substitution() {
-        let CrossSystemTest {
-            test,
-            mut system,
-            top,
-            left,
-            left_system,
-            right_system,
-            ..
-        } = CrossSystemTest::new();
-
-        system.link(top, left, Relation::Then);
-        Frame::swap(left_system, right_system);
-        system.mark(top);
-        system.run_until_done();
-
-        assert_eq!(test.log(), "Top:a Right:a");
-    }
-
-    #[test]
-    fn deep_system_substitution() {
         let test = Test::new();
-        let system = unsafe { &mut *System::new() };
+        let mut system = System::new();
 
-        let top = system.frame(Some(alloc(MockObject::new("top".to_string(), &test.log))));
+        let top = system.frame(Some(MockObject::new("top".to_string(), &test.log)));
 
         let left1 = system.frame(Some(System::new()));
         let left2 = System::from_frame(left1).unwrap().frame(
             Some(System::new()),
         );
-        let left3 = System::from_frame(left2).unwrap().frame(Some(
-            alloc(MockObject::new(
+        let left3 = System::from_frame(left2).unwrap().frame(
+            Some(MockObject::new(
                 "left3".to_string(),
                 &test.log,
             )),
-        ));
+        );
 
         let right1 = system.frame(Some(System::new()));
         let right2 = System::from_frame(right1).unwrap().frame(
             Some(System::new()),
         );
-        let right3 = System::from_frame(right2).unwrap().frame(Some(alloc(MockObject::new(
-            "right3".to_string(),
-            &test.log,
-        ))));
+        let right3 = System::from_frame(right2).unwrap().frame(
+            Some(MockObject::new(
+                "right3".to_string(),
+                &test.log,
+            )),
+        );
 
         system.link(top, left3, Relation::Then);
         system.mark(top);
         system.run_until_done();
 
+        assert_eq!(test.log(), "top left3");
+
         Frame::swap(left1, right1);
         system.mark(top);
         system.run_until_done();
 
+        assert_eq!(test.log(), "top left3 top right3");
+
         Frame::swap(left2, right2);
         system.mark(top);
         system.run_until_done();
+
+        assert_eq!(test.log(), "top left3 top right3 top left3");
 
         Frame::swap(left3, right3);
         system.mark(top);
         system.run_until_done();
 
         assert_eq!(test.log(), "top left3 top right3 top left3 top right3");
+    }
+
+    struct SlowObject(Log);
+
+    impl SlowObject {
+        fn new(log: &Log) -> Box<Self> {
+            Box::new(SlowObject(log.clone()))
+        }
+    }
+
+    impl Object for SlowObject {
+        fn name(&self) -> &'static str {
+            "SlowObject"
+        }
+        fn runnable(&mut self) -> Option<&mut Runnable> {
+            Some(self)
+        }
+        fn concrete(&mut self) -> ConcreteObject {
+            ConcreteObject::Other(self)
+        }
+    }
+
+    impl Runnable for SlowObject {
+        fn run(&mut self, context: &mut RunContext) {
+            use std::{thread, time};
+            self.0.borrow_mut().push("start".to_string());
+            let sender = context.background();
+            thread::spawn(move || {
+                thread::sleep(time::Duration::from_millis(10));
+                sender.send(Box::new(())).unwrap();
+            });
+        }
+        fn update(&mut self, _: &mut RunContext, _: Update) {
+            self.0.borrow_mut().push("end".to_string());
+        }
+    }
+
+    #[test]
+    fn background() {
+        let test = Test::new();
+        let mut system = System::new();
+        let slow = system.frame(Some(SlowObject::new(&test.log)));
+        let then = system.frame(Some(MockObject::new("mock".to_string(), &test.log)));
+        system.link(slow, then, Relation::Then);
+        system.mark(slow);
+        system.run_until_done();
+
+        assert_eq!(test.log(), "start end mock");
     }
 }
