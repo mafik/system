@@ -2,35 +2,20 @@ use std::collections::VecDeque;
 use std::slice;
 use std::ptr;
 use std::mem;
+use std::collections::HashMap;
 use std::any::Any;
 use std::sync::mpsc::{self, Sender, Receiver};
 
-fn alloc<T>(val: T) -> *mut T {
-    Box::into_raw(Box::new(val))
-}
-
-pub enum ConcreteObject {
-    Other(*mut Object),
-    System(*mut System),
-}
-
-type Update = Box<Any + Send>;
-
-pub trait RunContext {
-    fn background(&mut self) -> Sender<Update>;
-}
-
-pub trait Runnable {
-    fn run(&mut self, &mut RunContext);
-    fn update(&mut self, &mut RunContext, Update) {
-        unimplemented!();
-    }
-}
-
 pub trait Object {
     fn name(&self) -> &'static str;
-    fn runnable(&mut self) -> Option<&mut Runnable> {
-        None
+    fn can_run(&self) -> bool {
+        false
+    }
+    fn run(&mut self, _: RunContext) {
+        unimplemented!()
+    }
+    fn update(&mut self, _: Update) {
+        unimplemented!()
     }
     fn concrete(&mut self) -> ConcreteObject;
     fn deserialize(&mut self, Vec<u8>) {}
@@ -40,6 +25,36 @@ pub trait Object {
     fn elements(&self) -> &[*mut Frame] {
         unsafe { slice::from_raw_parts(ptr::null(), 0) }
     }
+}
+
+pub trait FrameData {
+    fn new() -> Self;
+}
+
+pub struct System {
+    frame: Option<*mut Frame>,
+    frames: Vec<*mut Frame>,
+    links: Vec<Link>,
+}
+
+pub struct Frame {
+    parent: *mut Object,
+    name: String,
+    object: Option<*mut Object>,
+    scheduled: bool,
+    running: bool,
+}
+
+pub enum ConcreteObject {
+    Other(*mut Object),
+    System(*mut System),
+}
+
+#[derive(Clone)]
+struct Link {
+    relation: Relation,
+    a: LinkEnd,
+    b: LinkEnd,
 }
 
 #[derive(Clone)]
@@ -54,55 +69,40 @@ enum LinkEnd {
     FrameElement(*mut Frame, String),
 }
 
+type Update = Box<Any + Send>;
+
+enum TaskEvent {
+    Update(Update),
+    Drop,
+}
+
+pub struct TaskLoop {
+    counter: u64,
+    background: HashMap<u64, Task>,
+    tx: Sender<(u64, TaskEvent)>,
+    rx: Receiver<(u64, TaskEvent)>,
+    tasks: VecDeque<Task>,
+}
+
+pub struct BackgroundTask {
+    id: u64,
+    tx: Sender<(u64, TaskEvent)>,
+}
+
+struct Task {
+    frame: *mut Frame,
+}
+
+pub struct RunContext<'a> {
+    task: Option<Task>,
+    task_loop: &'a mut TaskLoop,
+}
+
 impl LinkEnd {
     fn frame(&self) -> *mut Frame {
         match self {
             &LinkEnd::Frame(frame) => frame,
             &LinkEnd::FrameElement(frame, _) => frame,
-        }
-    }
-}
-
-#[derive(Clone)]
-struct Link {
-    relation: Relation,
-    a: LinkEnd,
-    b: LinkEnd,
-}
-
-pub struct Frame {
-    parent: *mut Object,
-    name: String,
-    object: Option<*mut Object>,
-}
-
-struct BackgroundTask {
-    frame: *mut Frame,
-    receiver: Receiver<Update>,
-}
-
-pub struct System {
-    frame: Option<*mut Frame>,
-    frames: Vec<*mut Frame>,
-    tasks: VecDeque<*mut Frame>,
-    links: Vec<Link>,
-    background_tasks: Vec<BackgroundTask>,
-}
-
-impl RunContext for Frame {
-    fn background(&mut self) -> Sender<Update> {
-        unsafe {
-            match (*self.parent).concrete() {
-                ConcreteObject::System(system) => {
-                    let (sender, receiver) = mpsc::channel();
-                    (*system).background_tasks.push(BackgroundTask {
-                        frame: self,
-                        receiver,
-                    });
-                    return sender;
-                }
-                _ => unimplemented!(),
-            }
         }
     }
 }
@@ -124,7 +124,153 @@ fn find_element(object: *const Object, name: &String) -> Option<*mut Frame> {
     return None;
 }
 
+impl TaskLoop {
+    pub fn new() -> TaskLoop {
+        let (tx, rx) = mpsc::channel();
+        TaskLoop {
+            counter: 0,
+            background: HashMap::new(),
+            tx,
+            rx,
+            tasks: VecDeque::new(),
+        }
+    }
+    fn background(&mut self, task: Task) -> BackgroundTask {
+        self.counter += 1;
+        self.background.insert(self.counter, task);
+        return BackgroundTask {
+            id: self.counter,
+            tx: self.tx.clone(),
+        };
+    }
+    fn post(&mut self, task: Task) {
+        self.tasks.push_back(task);
+    }
+    pub fn run_iterations(&mut self, n: u32) {
+        for _ in 0..n {
+            self.run_one();
+        }
+    }
+    pub fn run_until_done(&mut self) {
+        while self.run_one() {}
+    }
+    pub fn run_one(&mut self) -> bool {
+        match self.rx.try_recv() {
+            Ok((id, TaskEvent::Update(update))) => {
+                self.background.get_mut(&id).unwrap().update(update);
+                true
+            }
+            Ok((id, TaskEvent::Drop)) => {
+                let task = self.background.remove(&id).unwrap();
+                task.finish(self);
+                true
+            }
+            _ => {
+                match self.tasks.pop_front() {
+                    Some(task) => {
+                        task.run(self);
+                        true
+                    }
+                    None => {
+                        if self.background.is_empty() {
+                            false
+                        } else {
+                            match self.rx.recv() {
+                                Ok((id, TaskEvent::Update(update))) => {
+                                    self.background.get_mut(&id).unwrap().update(update);
+                                    true
+                                }
+                                Ok((id, TaskEvent::Drop)) => {
+                                    let task = self.background.remove(&id).unwrap();
+                                    task.finish(self);
+                                    true
+                                }
+                                _ => panic!(),
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+impl BackgroundTask {
+    pub fn send_update(&mut self, update: Update) {
+        self.tx.send((self.id, TaskEvent::Update(update))).unwrap();
+    }
+}
+
+impl Drop for BackgroundTask {
+    fn drop(&mut self) {
+        self.tx.send((self.id, TaskEvent::Drop)).unwrap();
+    }
+}
+
+impl<'a> RunContext<'a> {
+    pub fn background(mut self) -> BackgroundTask {
+        return self.task_loop.background(self.task.take().unwrap());
+    }
+}
+
+impl<'a> Drop for RunContext<'a> {
+    fn drop(&mut self) {
+        if let Some(task) = self.task.take() {
+            task.finish(self.task_loop);
+        }
+    }
+}
+
+impl Task {
+    // Executed by TaskLoop
+    fn run(self, task_loop: &mut TaskLoop) {
+        unsafe {
+            (*self.frame).scheduled = false;
+            (*self.frame).running = true;
+            match (*self.frame).object {
+                Some(object) => {
+                    (*object).run(RunContext {
+                        task: Some(self),
+                        task_loop: task_loop,
+                    });
+                }
+                None => unimplemented!(),
+            }
+        }
+    }
+    // Executed by TaskLoop
+    fn update(&mut self, update: Update) {
+        unsafe {
+            match (*self.frame).object {
+                Some(object) => {
+                    (*object).update(update);
+                }
+                None => unimplemented!(),
+            }
+        }
+    }
+    // Executed by TaskLoop
+    fn finish(self, task_loop: &mut TaskLoop) {
+        unsafe {
+            (*self.frame).running = false;
+            let system = (*self.frame).parent_system().unwrap();
+            system.run_finished(self.frame, task_loop);
+        }
+    }
+}
+
+fn alloc<T>(val: T) -> *mut T {
+    Box::into_raw(Box::new(val))
+}
+
 impl Frame {
+    fn schedule(&mut self, task_loop: &mut TaskLoop) {
+        if !self.scheduled {
+            self.scheduled = true;
+            task_loop.post(Task { frame: self });
+        }
+    }
+
     pub fn adopt(&mut self, adopted: Option<Box<Object>>) {
         self.object = adopted.map(Box::into_raw);
         self.maybe_update_frame();
@@ -174,9 +320,7 @@ impl System {
         Box::new(System {
             frame: None,
             frames: Vec::new(),
-            tasks: VecDeque::new(),
             links: Vec::new(),
-            background_tasks: Vec::new(),
         })
     }
     fn from_object(object: *mut Object) -> Option<&'static mut System> {
@@ -225,91 +369,22 @@ impl System {
             (*frame).name = name;
         }
     }
-    pub fn frame(&mut self, object: Option<Box<Object>>) -> *mut Frame {
+    pub fn frame(&mut self, object: Option<Box<Object>>) -> &'static mut Frame {
         let frame = alloc(Frame {
             parent: self,
             name: String::new(),
             object: object.map(Box::into_raw),
+            running: false,
+            scheduled: false,
         });
         self.pick_name(frame);
         unsafe {
             (*frame).maybe_update_frame();
         }
         self.frames.push(frame);
-        return frame;
+        return unsafe { &mut *frame };
     }
-    /// Adds frame to the task lisk regardless of whether it's already there.
-    fn post(&mut self, frame: *mut Frame) {
-        self.tasks.push_back(frame);
-    }
-    /// Checks if a frame is already on the task list.
-    fn is_marked(&self, frame: *mut Frame) -> bool {
-        for task in self.tasks.iter() {
-            if *task == frame {
-                return true;
-            }
-        }
-        return false;
-    }
-    /// Marks the frame for execution.
-    fn mark(&mut self, frame: *mut Frame) {
-        unsafe {
-            if let Some(mut system) = System::from_object((*frame).parent) {
-                if !system.is_marked(frame) {
-                    system.post(frame);
-                    if let Some(parent) = system.frame {
-                        self.mark(parent);
-                    }
-                }
-            }
-        }
-    }
-    pub fn run_until_done(&mut self) {
-        while !self.tasks.is_empty() || !self.background_tasks.is_empty() {
-            self.run_one();
-        }
-    }
-    pub fn run_iterations(&mut self, iterations: u32) {
-        for _ in 0..iterations {
-            self.run_one();
-        }
-    }
-    pub fn run_one(&mut self) {
-        // TODO: Replace with multi-channel selection, once it's available
-        //       (https://github.com/rust-lang/rust/issues/27800)
-
-        let mut i = 0;
-        while i < self.background_tasks.len() {
-            let recv_result = self.background_tasks[i].receiver.try_recv();
-            match recv_result {
-                Ok(update) => {
-                    let frame = self.background_tasks[i].frame;
-                    let object = unsafe { (*frame).object };
-                    let object = object.unwrap();
-                    let runnable = unsafe { (*object).runnable() };
-                    let runnable = runnable.unwrap();
-                    runnable.update(unsafe { &mut *frame }, update);
-                    return;
-                }
-                Err(mpsc::TryRecvError::Empty) => {
-                    i += 1;
-                }
-                Err(mpsc::TryRecvError::Disconnected) => {
-                    let frame = self.background_tasks[i].frame;
-                    self.background_tasks.swap_remove(i);
-                    self.run_finished(frame);
-                }
-            }
-        }
-
-        match self.tasks.pop_front() {
-            Some(frame) => {
-                self.run_frame(frame);
-            }
-            None => (),
-        }
-    }
-    fn run_finished(&mut self, frame: *mut Frame) {
+    fn run_finished(&mut self, frame: *mut Frame, task_loop: &mut TaskLoop) {
         for link in self.links.clone().into_iter() {
             match link.relation {
                 Relation::Then => {}
@@ -324,14 +399,14 @@ impl System {
                 _ => continue,
             }
             match link.b {
-                LinkEnd::Frame(link_b) => {
-                    self.mark(link_b);
-                }
+                LinkEnd::Frame(link_b) => unsafe {
+                    (*link_b).schedule(task_loop);
+                },
                 LinkEnd::FrameElement(frame, element) => unsafe {
                     let target = (*frame).find_element(&element);
                     match target {
                         Some(frame) => {
-                            self.mark(frame);
+                            (*frame).schedule(task_loop);
                         }
                         None => {
                             panic!("Element {} not found", element);
@@ -341,30 +416,7 @@ impl System {
             }
         }
         if let Some(parent) = self.parent_system() {
-            parent.run_finished(frame);
-        }
-    }
-    fn is_running(&self, frame: *mut Frame) -> bool {
-        self.background_tasks.iter().any(|task| {
-            ptr::eq(task.frame, frame)
-        })
-    }
-    fn run_frame(&mut self, frame: *mut Frame) {
-        unsafe {
-            match (*frame).object {
-                Some(object) => {
-                    match (*object).runnable() {
-                        Some(ref mut runnable) => {
-                            runnable.run(&mut *frame);
-                            if !self.is_running(frame) {
-                                self.run_finished(frame);
-                            }
-                        }
-                        _ => unimplemented!(),
-                    }
-                }
-                _ => unimplemented!(),
-            };
+            parent.run_finished(frame, task_loop);
         }
     }
     fn contains(&self, frame: *mut Frame) -> bool {
@@ -454,22 +506,8 @@ impl Object for System {
     fn concrete(&mut self) -> ConcreteObject {
         ConcreteObject::System(self)
     }
-    fn runnable(&mut self) -> Option<&mut Runnable> {
-        Some(self)
-    }
     fn elements(&self) -> &[*mut Frame] {
         &self.frames
-    }
-}
-
-impl Runnable for System {
-    fn run(&mut self, _: &mut RunContext) {
-        self.run_one();
-        if !self.tasks.is_empty() || !self.background_tasks.is_empty() {
-            if let Some(frame) = self.frame {
-                self.mark(frame);
-            }
-        }
     }
 }
 
@@ -499,35 +537,36 @@ mod tests {
         fn name(&self) -> &'static str {
             "MockObject"
         }
-        fn runnable(&mut self) -> Option<&mut Runnable> {
-            Some(self)
+        fn can_run(&self) -> bool {
+            true
+        }
+        fn run(&mut self, _: RunContext) {
+            self.log.borrow_mut().push(self.name.clone());
         }
         fn concrete(&mut self) -> ConcreteObject {
             ConcreteObject::Other(self)
         }
     }
 
-    impl Runnable for MockObject {
-        fn run(&mut self, _: &mut RunContext) {
-            self.log.borrow_mut().push(self.name.clone());
-        }
-    }
-
     struct TestableSystem {
         system: Box<System>,
-        a: *mut Frame,
-        b: *mut Frame,
-        c: *mut Frame,
+        a: &'static mut Frame,
+        b: &'static mut Frame,
+        c: &'static mut Frame,
     }
 
     struct Test {
         log: Log,
+        task_loop: TaskLoop,
     }
 
     impl Test {
         fn new() -> Self {
             let log = Rc::new(RefCell::new(Vec::new()));
-            Test { log }
+            Test {
+                log,
+                task_loop: TaskLoop::new(),
+            }
         }
         fn make_system(&self, name: &'static str) -> TestableSystem {
             let mut system = System::new();
@@ -544,54 +583,54 @@ mod tests {
 
     #[test]
     fn run_nothing() {
-        let test = Test::new();
-        let TestableSystem { mut system, .. } = test.make_system("");
-        system.run_until_done();
+        let mut test = Test::new();
+        test.make_system("");
+        test.task_loop.run_until_done();
         assert_eq!(test.log(), "");
     }
 
     #[test]
     fn run_one() {
-        let test = Test::new();
-        let TestableSystem { mut system, a, .. } = test.make_system("");
-        system.mark(a);
-        system.run_until_done();
+        let mut test = Test::new();
+        let TestableSystem { a, .. } = test.make_system("");
+        a.schedule(&mut test.task_loop);
+        test.task_loop.run_until_done();
         assert_eq!(test.log(), ":a");
     }
 
     #[test]
     fn swap() {
-        let test = Test::new();
-        let TestableSystem { mut system, a, b, .. } = test.make_system("");
+        let mut test = Test::new();
+        let TestableSystem { a, b, .. } = test.make_system("");
         Frame::swap(a, b);
-        system.mark(a);
-        system.run_until_done();
+        a.schedule(&mut test.task_loop);
+        test.task_loop.run_until_done();
         assert_eq!(test.log(), ":b");
     }
 
     #[test]
     fn then() {
-        let test = Test::new();
+        let mut test = Test::new();
         let TestableSystem { mut system, a, b, .. } = test.make_system("");
         system.link(a, b, Relation::Then);
-        system.mark(a);
-        system.run_until_done();
+        a.schedule(&mut test.task_loop);
+        test.task_loop.run_until_done();
         assert_eq!(test.log(), ":a :b");
     }
 
     #[test]
     fn test_loop() {
-        let test = Test::new();
+        let mut test = Test::new();
         let TestableSystem { mut system, a, .. } = test.make_system("");
         system.link(a, a, Relation::Then);
-        system.mark(a);
-        system.run_iterations(3);
+        a.schedule(&mut test.task_loop);
+        test.task_loop.run_iterations(3);
         assert_eq!(test.log(), ":a :a :a");
     }
 
     #[test]
     fn split() {
-        let test = Test::new();
+        let mut test = Test::new();
         let TestableSystem {
             mut system,
             a,
@@ -600,14 +639,14 @@ mod tests {
         } = test.make_system("");
         system.link(a, b, Relation::Then);
         system.link(a, c, Relation::Then);
-        system.mark(a);
-        system.run_until_done();
+        a.schedule(&mut test.task_loop);
+        test.task_loop.run_until_done();
         assert_eq!(test.log(), ":a :b :c");
     }
 
     #[test]
     fn merge() {
-        let test = Test::new();
+        let mut test = Test::new();
         let TestableSystem {
             mut system,
             a,
@@ -616,15 +655,15 @@ mod tests {
         } = test.make_system("");
         system.link(a, c, Relation::Then);
         system.link(b, c, Relation::Then);
-        system.mark(a);
-        system.mark(b);
-        system.run_until_done();
+        a.schedule(&mut test.task_loop);
+        b.schedule(&mut test.task_loop);
+        test.task_loop.run_until_done();
         assert_eq!(test.log(), ":a :b :c");
     }
 
     #[test]
     fn repeat() {
-        let test = Test::new();
+        let mut test = Test::new();
         let TestableSystem {
             mut system,
             a,
@@ -633,10 +672,10 @@ mod tests {
         } = test.make_system("");
         system.link(a, c, Relation::Then);
         system.link(b, c, Relation::Then);
-        system.mark(a);
-        system.run_until_done();
-        system.mark(b);
-        system.run_until_done();
+        a.schedule(&mut test.task_loop);
+        test.task_loop.run_until_done();
+        b.schedule(&mut test.task_loop);
+        test.task_loop.run_until_done();
         assert_eq!(test.log(), ":a :c :b :c");
     }
 
@@ -645,11 +684,9 @@ mod tests {
     struct CrossSystemTest {
         test: Test,
         system: Box<System>,
-        top: *mut Frame,
-        left: *mut Frame,
-        right: *mut Frame,
-        left_system: *mut Frame,
-        right_system: *mut Frame,
+        top: &'static mut Frame,
+        left: &'static mut Frame,
+        right: &'static mut Frame,
     }
 
     impl CrossSystemTest {
@@ -666,18 +703,14 @@ mod tests {
                 a: right_a,
                 ..
             } = test.make_system("Right");
-            unsafe {
-                (*top.b).adopt(Some(left_system));
-                (*top.c).adopt(Some(right_system));
-            }
+            top.b.adopt(Some(left_system));
+            top.c.adopt(Some(right_system));
             CrossSystemTest {
                 test,
                 system: top.system,
                 top: top.a,
                 left: left_a,
-                left_system: top.b,
                 right: right_a,
-                right_system: top.c,
             }
         }
     }
@@ -685,7 +718,7 @@ mod tests {
     #[test]
     fn enter_system() {
         let CrossSystemTest {
-            test,
+            mut test,
             mut system,
             top,
             left,
@@ -693,8 +726,8 @@ mod tests {
         } = CrossSystemTest::new();
 
         system.link(top, left, Relation::Then);
-        system.mark(top);
-        system.run_iterations(2);
+        top.schedule(&mut test.task_loop);
+        test.task_loop.run_iterations(2);
 
         assert_eq!(test.log(), "Top:a Left:a");
     }
@@ -702,7 +735,7 @@ mod tests {
     #[test]
     fn exit_system() {
         let CrossSystemTest {
-            test,
+            mut test,
             mut system,
             top,
             left,
@@ -710,8 +743,8 @@ mod tests {
         } = CrossSystemTest::new();
 
         system.link(left, top, Relation::Then);
-        system.mark(left);
-        system.run_iterations(2);
+        left.schedule(&mut test.task_loop);
+        test.task_loop.run_iterations(2);
 
         assert_eq!(test.log(), "Left:a Top:a");
     }
@@ -719,28 +752,24 @@ mod tests {
     #[test]
     fn cross_systems() {
         let CrossSystemTest {
-            test,
+            mut test,
             mut system,
             left,
             right,
-            left_system,
-            right_system,
             ..
         } = CrossSystemTest::new();
 
         system.link(left, right, Relation::Then);
         system.link(right, left, Relation::Then);
-        system.mark(left);
-        System::from_frame(left_system).unwrap().run_until_done();
-        System::from_frame(right_system).unwrap().run_until_done();
-        system.run_iterations(2);
+        left.schedule(&mut test.task_loop);
+        test.task_loop.run_iterations(4);
 
         assert_eq!(test.log(), "Left:a Right:a Left:a Right:a");
     }
 
     #[test]
     fn system_substitution() {
-        let test = Test::new();
+        let mut test = Test::new();
         let mut system = System::new();
 
         let top = system.frame(Some(MockObject::new("top".to_string(), &test.log)));
@@ -768,26 +797,26 @@ mod tests {
         );
 
         system.link(top, left3, Relation::Then);
-        system.mark(top);
-        system.run_until_done();
+        top.schedule(&mut test.task_loop);
+        test.task_loop.run_until_done();
 
         assert_eq!(test.log(), "top left3");
 
         Frame::swap(left1, right1);
-        system.mark(top);
-        system.run_until_done();
+        top.schedule(&mut test.task_loop);
+        test.task_loop.run_until_done();
 
         assert_eq!(test.log(), "top left3 top right3");
 
         Frame::swap(left2, right2);
-        system.mark(top);
-        system.run_until_done();
+        top.schedule(&mut test.task_loop);
+        test.task_loop.run_until_done();
 
         assert_eq!(test.log(), "top left3 top right3 top left3");
 
         Frame::swap(left3, right3);
-        system.mark(top);
-        system.run_until_done();
+        top.schedule(&mut test.task_loop);
+        test.task_loop.run_until_done();
 
         assert_eq!(test.log(), "top left3 top right3 top left3 top right3");
     }
@@ -804,38 +833,35 @@ mod tests {
         fn name(&self) -> &'static str {
             "SlowObject"
         }
-        fn runnable(&mut self) -> Option<&mut Runnable> {
-            Some(self)
-        }
         fn concrete(&mut self) -> ConcreteObject {
             ConcreteObject::Other(self)
         }
-    }
-
-    impl Runnable for SlowObject {
-        fn run(&mut self, context: &mut RunContext) {
+        fn can_run(&self) -> bool {
+            true
+        }
+        fn run(&mut self, ctx: RunContext) {
             use std::{thread, time};
             self.0.borrow_mut().push("start".to_string());
-            let sender = context.background();
+            let mut background = ctx.background();
             thread::spawn(move || {
                 thread::sleep(time::Duration::from_millis(10));
-                sender.send(Box::new(())).unwrap();
+                background.send_update(Box::new(()));
             });
         }
-        fn update(&mut self, _: &mut RunContext, _: Update) {
+        fn update(&mut self, _: Update) {
             self.0.borrow_mut().push("end".to_string());
         }
     }
 
     #[test]
     fn background() {
-        let test = Test::new();
+        let mut test = Test::new();
         let mut system = System::new();
         let slow = system.frame(Some(SlowObject::new(&test.log)));
         let then = system.frame(Some(MockObject::new("mock".to_string(), &test.log)));
         system.link(slow, then, Relation::Then);
-        system.mark(slow);
-        system.run_until_done();
+        slow.schedule(&mut test.task_loop);
+        test.task_loop.run_until_done();
 
         assert_eq!(test.log(), "start end mock");
     }
